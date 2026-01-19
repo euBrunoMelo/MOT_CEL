@@ -67,7 +67,7 @@ Este projeto implementa um sistema completo de **detecção e rastreamento de ob
 ### Passo 1: Clonar o repositório
 
 ```bash
-git clone https://github.com/seu-usuario/MOT_CEL.git
+git clone https://github.com/euBrunoMelo/MOT_CEL.git
 cd MOT_CEL
 ```
 
@@ -329,7 +329,7 @@ Este projeto está sob a licença MIT. Veja o arquivo [LICENSE](LICENSE) para ma
 
 **Bruno**
 
-- GitHub: [@seu-usuario](https://github.com/seu-usuario)
+- GitHub: [@euBrunoMelo](https://github.com/euBrunoMelo)
 
 ## 🙏 Agradecimentos
 

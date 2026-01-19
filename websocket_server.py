@@ -1,6 +1,7 @@
 """
 WebSocket Server para streaming de vídeo em tempo real
 Integrado com o serviço BentoML
+Implementa guardrails de Input Validation
 """
 
 import asyncio
@@ -13,6 +14,9 @@ from typing import Set, Dict, Any
 import logging
 import aiohttp
 from datetime import datetime
+
+# Importar guardrails de Input Validation
+from guardrails import FrameValidator, RateLimiter
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +49,10 @@ class VideoStreamHandler:
         self.active_connections.discard(websocket)
         if session_id in self.session_data:
             del self.session_data[session_id]
+        
+        # Resetar rate limiting da sessão ao desconectar
+        RateLimiter.reset_session(session_id)
+        
         logger.info(f"Conexão removida: {session_id}")
         
     async def process_frame(self, frame_data: str, session_id: str) -> Dict[str, Any]:
@@ -148,7 +156,41 @@ async def handle_client(websocket: Any):
                     frame_data = data.get("data", "")
                     
                     if frame_data:
-                        # Processar através do BentoML
+                        # ==============================================================
+                        # INPUT VALIDATION - Validação rápida antes de enviar ao BentoML
+                        # ==============================================================
+                        # Validar session_id
+                        is_valid_session, session_error = FrameValidator.validate_session_id(session_id)
+                        if not is_valid_session:
+                            logger.warning(f"Session ID inválido no WebSocket: {session_error}")
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "session_id": session_id,
+                                "error": f"Invalid session_id: {session_error}"
+                            }))
+                            continue
+                        
+                        # Validação básica do frame (tamanho máximo)
+                        if len(frame_data) > FrameValidator.MAX_FRAME_SIZE:
+                            logger.warning(f"Frame muito grande rejeitado: {len(frame_data)} bytes")
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "session_id": session_id,
+                                "error": f"Frame too large: {len(frame_data)} bytes (max: {FrameValidator.MAX_FRAME_SIZE})"
+                            }))
+                            continue
+                        
+                        # Validação básica do formato
+                        if not isinstance(frame_data, str) or len(frame_data) < 100:
+                            logger.warning(f"Frame data inválido: não é string ou muito pequeno")
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "session_id": session_id,
+                                "error": "Invalid frame data format"
+                            }))
+                            continue
+                        
+                        # Processar através do BentoML (que fará validação completa)
                         result = await stream_handler.process_frame(frame_data, session_id)
                         
                         # Preparar resposta
@@ -159,6 +201,16 @@ async def handle_client(websocket: Any):
                             "annotated_frame": result.get("annotated_frame", ""),
                             "timestamp": result.get("timestamp", 0)
                         }
+                        
+                        # Adicionar informações de validação se disponíveis (para debug)
+                        if "validation_stats" in result:
+                            response["validation_stats"] = result["validation_stats"]
+                        
+                        # Adicionar erro se houver
+                        if "error" in result:
+                            response["error"] = result["error"]
+                            response["type"] = "error"
+                            logger.warning(f"Erro no processamento para sessão {session_id}: {result['error']}")
                         
                         # Enviar resultado de volta
                         await websocket.send(json.dumps(response))

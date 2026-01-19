@@ -1,6 +1,7 @@
 """
 YOLO Object Detection and Tracking Service with BentoML 1.4+
 Suporta streaming de vídeo em tempo real via WebRTC/WebSocket
+Implementa guardrails de Input Validation e Output Filtering
 """
 
 import bentoml
@@ -12,6 +13,14 @@ from typing import Dict, Any, List
 import time
 from collections import defaultdict
 from pydantic import BaseModel
+import logging
+
+# Importar guardrails (Input Validation e Output Filtering)
+from guardrails import FrameValidator, DetectionValidator
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configurações do serviço
 MODEL_PATH = "best.pt"
@@ -147,43 +156,100 @@ class YOLOService:
         """
         Endpoint para processar frames de vídeo codificados em base64
         Usado para integração com WebRTC/WebSocket
+        Implementa guardrails de Input Validation e Output Filtering
         """
         try:
-            # Decodificar frame base64
+            # ===================================================================
+            # INPUT VALIDATION - Guardrail de entrada
+            # ===================================================================
             frame_data = data.get("frame", "")
             session_id = data.get("session_id", "default")
             
-            if not frame_data:
-                return {"error": "No frame data provided", "detections": [], "frame_shape": [], "timestamp": time.time(), "session_id": session_id}
+            # 1. Validar session_id
+            is_valid_session, session_error = FrameValidator.validate_session_id(session_id)
+            if not is_valid_session:
+                logger.warning(f"Session ID inválido: {session_error}")
+                return {
+                    "error": f"Invalid session_id: {session_error}",
+                    "detections": [],
+                    "frame_shape": [],
+                    "timestamp": time.time(),
+                    "session_id": session_id
+                }
             
-            # Remover prefixo data URL se presente
-            if "," in frame_data:
-                frame_data = frame_data.split(",")[1]
+            # 2. Validar frame_data (tamanho, formato, dimensões, rate limiting)
+            is_valid, error_msg, frame = FrameValidator.validate_frame_data(frame_data, session_id)
             
-            # Decodificar base64 para bytes
-            frame_bytes = base64.b64decode(frame_data)
+            if not is_valid:
+                logger.warning(f"Validação de frame falhou para sessão {session_id}: {error_msg}")
+                return {
+                    "error": f"Frame validation failed: {error_msg}",
+                    "detections": [],
+                    "frame_shape": [],
+                    "timestamp": time.time(),
+                    "session_id": session_id
+                }
             
-            # Converter bytes para numpy array
-            nparr = np.frombuffer(frame_bytes, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            # Frame validado com sucesso!
+            logger.debug(f"Frame validado com sucesso para sessão {session_id}: {frame.shape[1]}x{frame.shape[0]}")
             
-            if frame is None:
-                return {"error": "Failed to decode frame", "detections": [], "frame_shape": [], "timestamp": time.time(), "session_id": session_id}
-            
-            # Processar frame
+            # ===================================================================
+            # PROCESSAMENTO - Detecção e tracking
+            # ===================================================================
             result = self.tracker.detect_and_track(frame, session_id)
             
-            # Adicionar frame anotado se solicitado
+            # ===================================================================
+            # OUTPUT FILTERING - Guardrail de saída
+            # ===================================================================
+            # Validar formato do frame_shape retornado
+            frame_shape_tuple = tuple(result.get("frame_shape", []))
+            if len(frame_shape_tuple) != 2:
+                logger.error(f"Frame shape inválido retornado: {frame_shape_tuple}")
+                frame_shape_tuple = (frame.shape[0], frame.shape[1])
+            
+            # Validar e filtrar detecções
+            original_detections_count = len(result.get("detections", []))
+            valid_detections, warnings = DetectionValidator.validate_detections(
+                result.get("detections", []),
+                frame_shape_tuple
+            )
+            
+            # Log warnings se houver
+            if warnings:
+                for warning in warnings:
+                    logger.debug(f"Warning na validação de detecções: {warning}")
+            
+            # Atualizar resultado com detecções validadas
+            result["detections"] = valid_detections
+            result["frame_shape"] = list(frame_shape_tuple)
+            
+            # Adicionar estatísticas de validação ao resultado (opcional, para debug)
+            result["validation_stats"] = {
+                "original_count": original_detections_count,
+                "validated_count": len(valid_detections),
+                "warnings_count": len(warnings),
+                "warnings": warnings[:5]  # Limitar a 5 warnings no resultado
+            }
+            
+            # ===================================================================
+            # ANOTAÇÃO - Gerar frame anotado se solicitado
+            # ===================================================================
             if data.get("return_annotated", False):
-                annotated_frame = draw_annotations(frame, result["detections"], self.tracker)
+                annotated_frame = draw_annotations(frame, valid_detections, self.tracker)
                 _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 result["annotated_frame"] = base64.b64encode(buffer).decode('utf-8')
+            
+            logger.debug(
+                f"Processamento concluído para sessão {session_id}: "
+                f"{len(valid_detections)} detecções válidas de {original_detections_count} originais"
+            )
             
             return result
             
         except Exception as e:
+            logger.error(f"Erro inesperado ao processar frame: {type(e).__name__} - {e}", exc_info=True)
             return {
-                "error": str(e),
+                "error": f"Unexpected error: {str(e)}",
                 "detections": [],
                 "frame_shape": [],
                 "timestamp": time.time(),
